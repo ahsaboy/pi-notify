@@ -1,0 +1,532 @@
+/**
+ * pi-notify — Event subscription registry
+ *
+ * Maps pi lifecycle events to notification dispatch.
+ * Supports built-in events and dynamic discovery via MODULE_READY.
+ */
+
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { UNIPI_EVENTS, emitEvent } from "@pi-unipi/core";
+import type { NotifyConfig, NotifyPlatform, NotifyDispatchResult, NotifyPriority } from "./types.js";
+import { sendNativeNotification, SuppressedError } from "./platforms/native.js";
+import { sendWebhookNotification } from "./webhook.js";
+import { buildAskUserPromptMessage } from "./ask-user-prompt-message.js";
+import { buildPermissionPromptMessage } from "./permission-prompt-message.js";
+import { summarizeLastMessage } from "./summarize.js";
+import { filterPlatformsAfterInput, isBlockingEvent } from "./activity.js";
+
+// Event emitted by @juicesharp/rpiv-ask-user-question before showing its UI.
+// Keep this as a local string until that package publishes an importable
+// `./events` contract in npm.
+const ASK_USER_PROMPT_EVENT = "rpiv:ask-user:prompt" as const;
+
+// Event emitted by @gotgenes/pi-permission-system immediately before the
+// user-facing permission UI is invoked. Fires only for prompts a human must
+// answer — policy auto-allow/deny and session approvals do not emit it.
+// Kept as a local string (like the rpiv event above) because it belongs to a
+// third-party package rather than the unipi event contract.
+const PERMISSION_UI_PROMPT_EVENT = "permissions:ui_prompt" as const;
+
+/** Minimal shape of the background-tasks shared registry (optional sibling package). */
+type SharedTaskRegistryLike = {
+  allTasks(): ReadonlyArray<{ status?: string; triggerOnCompletion?: boolean }>;
+};
+
+/** Symbol @pi-unipi/background-tasks publishes its live registry under. */
+const SHARED_REGISTRY_KEY = Symbol.for("unipi.background-tasks.shared-registry");
+
+/**
+ * True when a background task will wake the agent with its own follow-up turn.
+ * Reads the shared globalThis symbol directly rather than importing
+ * @pi-unipi/background-tasks, so notify has zero load-order or dependency
+ * coupling to that optional sibling. Any read failure means "no pending wake".
+ */
+export function hasPendingWakeTask(): boolean {
+  try {
+    const registry = (globalThis as Record<symbol, unknown>)[SHARED_REGISTRY_KEY] as
+      | SharedTaskRegistryLike
+      | undefined;
+    if (typeof registry?.allTasks !== "function") return false;
+    const tasks = registry.allTasks();
+    return Array.isArray(tasks)
+      ? tasks.some((task) => task.status === "running" && task.triggerOnCompletion === true)
+      : false;
+  } catch {
+    return false;
+  }
+}
+
+/** Default dispatch priority for an event type, when the event path sets one. */
+function defaultEventPriority(eventKey: string): NotifyPriority | undefined {
+  if (isBlockingEvent(eventKey)) return "high";
+  if (isAgentNotificationEvent(eventKey)) return "low";
+  return undefined;
+}
+
+/** Stored session context for modelRegistry access */
+let sessionCtx: ExtensionContext | null = null;
+
+/** Unsubscribe functions for pi.events.on() listeners. Cleared before each registration to avoid accumulation across reloads. */
+const unsubs: Array<() => void> = [];
+
+/** Pending re-notify interval for an unanswered blocking prompt. */
+let renotifyTimer: ReturnType<typeof setInterval> | undefined;
+
+/** Cancel any pending re-notify timer. Safe to call at any time. */
+export function disarmRenotify(): void {
+  const timer = renotifyTimer;
+  renotifyTimer = undefined;
+  if (timer === undefined) return;
+  try {
+    clearInterval(timer);
+  } catch {
+    // Timer already gone (e.g. after a reload) — nothing to clear.
+  }
+}
+
+/**
+ * (Re)arm the reminder loop for a blocking prompt. Only one prompt can be
+ * outstanding at a time, so arming replaces any existing timer rather than
+ * stacking a second one.
+ */
+function armRenotify(
+  pi: ExtensionAPI,
+  title: string,
+  message: string,
+  platforms: NotifyPlatform[],
+  eventType: string,
+  config: NotifyConfig,
+  cwd: string,
+  dispatch: DispatchNotification,
+  payload?: unknown,
+): void {
+  disarmRenotify();
+  const { enabled, intervalMs, maxRepeats } = config.renotify;
+  if (!enabled || maxRepeats <= 0) return;
+
+  let fired = 0;
+  const timer = setInterval(() => {
+    fired += 1;
+    dispatch(
+      pi,
+      `${title} (still waiting)`,
+      message,
+      platforms,
+      eventType,
+      config,
+      cwd,
+      "high",
+      payload,
+    ).catch(() => {
+      // Silently ignore — background notification failure is non-blocking.
+    });
+    if (fired >= maxRepeats) disarmRenotify();
+  }, intervalMs);
+  // Never hold the process open for a reminder. (undefined-safe for mocked timers.)
+  timer.unref?.();
+  renotifyTimer = timer;
+}
+
+/** Unregister all previously registered pi.events.on() listeners. */
+function unregisterAll(): void {
+  disarmRenotify();
+  for (const unsub of unsubs) {
+    try { unsub(); } catch { /* ignore */ }
+  }
+  unsubs.length = 0;
+}
+
+/** Store session context (called from index.ts on session_start) */
+export function setSessionContext(ctx: ExtensionContext): void {
+  sessionCtx = ctx;
+}
+
+/** Clear session context (called on session_shutdown) */
+export function clearSessionContext(): void {
+  sessionCtx = null;
+}
+
+/** Built-in event definitions — maps event key to pi hook + display label */
+export const BUILTIN_EVENTS: Record<
+  string,
+  { hook: string; label: string }
+> = {
+  agent_end: { hook: "agent_end", label: "Agent Run Complete" },
+  agent_settled: { hook: "agent_settled", label: "Agent Complete" },
+  workflow_end: { hook: UNIPI_EVENTS.WORKFLOW_END, label: "Workflow Done" },
+  ralph_loop_end: { hook: UNIPI_EVENTS.RALPH_LOOP_END, label: "Ralph Complete" },
+  mcp_server_error: { hook: UNIPI_EVENTS.MCP_SERVER_ERROR, label: "MCP Error" },
+  memory_consolidated: { hook: UNIPI_EVENTS.MEMORY_CONSOLIDATED, label: "Memory Saved" },
+  session_shutdown: { hook: "session_shutdown", label: "Session End" },
+  ask_user_prompt: { hook: UNIPI_EVENTS.ASK_USER_PROMPT, label: "Question Asked" },
+  permission_request: { hook: PERMISSION_UI_PROMPT_EVENT, label: "Permission Request" },
+};
+
+/**
+ * Pi lifecycle event types (dispatched by ExtensionRunner).
+ * These must use pi.on() — not pi.events.on() — to receive events.
+ */
+const LIFECYCLE_EVENTS = new Set(["agent_end", "agent_settled", "session_shutdown"]);
+
+/**
+ * Register event listeners for all enabled notification events.
+ * Attaches listeners to pi hooks and routes notifications to platforms.
+ */
+export function registerEventListeners(
+  pi: ExtensionAPI,
+  config: NotifyConfig,
+  cwd: string,
+  dispatch: DispatchNotification = dispatchNotification
+): void {
+  // Remove all previously registered EventBus listeners to prevent accumulation
+  // across reloads (EventBus persists but module instances are replaced).
+  unregisterAll();
+  // Register built-in events (except agent lifecycle notifications which have custom logic)
+  for (const [eventKey, def] of Object.entries(BUILTIN_EVENTS)) {
+    if (isAgentNotificationEvent(eventKey)) continue; // handled separately below
+
+    const eventConfig = config.events[eventKey];
+    if (!eventConfig?.enabled) continue;
+
+    const handler = (payload: unknown) => {
+      const title = `Pi — ${def.label}`;
+      const message = buildEventMessage(eventKey, payload);
+      // Fire-and-forget: don't block the event emitter
+      dispatch(
+        pi,
+        title,
+        message,
+        eventConfig.platforms,
+        eventKey,
+        config,
+        cwd,
+        defaultEventPriority(eventKey),
+        payload,
+      ).catch(() => {
+        // Silently ignore — background notification failure is non-blocking.
+      });
+      if (isBlockingEvent(eventKey)) {
+        armRenotify(pi, title, message, eventConfig.platforms, eventKey, config, cwd, dispatch, payload);
+      }
+    };
+
+    // Pi lifecycle events are dispatched via ExtensionRunner — must use
+    // pi.on(). These are stored in
+    // extension.handlers and automatically replaced on reload, so they
+    // do NOT accumulate like EventBus listeners.
+    if (LIFECYCLE_EVENTS.has(eventKey)) {
+      (pi as any).on(def.hook, handler);
+    } else {
+      unsubs.push(pi.events.on(def.hook, handler));
+    }
+  }
+
+  // Listen for rpiv:ask-user:prompt from @juicesharp/rpiv-ask-user-question
+  const askUserConfig = config.events["ask_user_prompt"];
+  if (askUserConfig?.enabled) {
+    unsubs.push(pi.events.on(ASK_USER_PROMPT_EVENT, (payload: unknown) => {
+      const title = `Pi — ${BUILTIN_EVENTS.ask_user_prompt.label}`;
+      const message = buildAskUserPromptMessage(payload);
+      dispatch(pi, title, message, askUserConfig.platforms, "ask_user_prompt", config, cwd, "high", payload).catch(
+        () => {
+          // Silently ignore — background notification failure is non-blocking.
+        }
+      );
+      armRenotify(pi, title, message, askUserConfig.platforms, "ask_user_prompt", config, cwd, dispatch, payload);
+    }));
+  }
+
+  // A reminder loop must never outlive the prompt it is nagging about: any of
+  // these signals means the human acted or the agent moved on.
+  unsubs.push(pi.events.on("herdr:blocked", (payload: unknown) => {
+    if ((payload as { active?: unknown } | null)?.active === false) disarmRenotify();
+  }));
+  (pi as any).on("agent_start", () => {
+    disarmRenotify();
+  });
+
+  registerAgentNotification(pi, "agent_end", config, cwd, dispatch);
+  registerAgentNotification(pi, "agent_settled", config, cwd, dispatch);
+}
+
+/** Get all platforms that are currently enabled in config */
+function getEnabledPlatforms(config: NotifyConfig): NotifyPlatform[] {
+  const enabled: NotifyPlatform[] = [];
+  if (config.native.enabled) enabled.push("native");
+  for (const webhook of config.webhooks) {
+    if (webhook.enabled) enabled.push(`webhook:${webhook.id}`);
+  }
+  return enabled;
+}
+
+/** No-op — cleanup handled by session teardown */
+export function unregisterEventListeners(): void {
+  unregisterAll();
+}
+
+/** Dispatcher signature — injectable so tests can observe calls without sending. */
+export type DispatchNotification = typeof dispatchNotification;
+
+/**
+ * Dispatch a notification to the configured platforms.
+ * Sends to all specified platforms (or defaults) in parallel.
+ */
+export async function dispatchNotification(
+  pi: ExtensionAPI,
+  title: string,
+  message: string,
+  eventPlatforms: NotifyPlatform[],
+  eventType: string,
+  config: NotifyConfig,
+  cwd: string,
+  priority?: NotifyPriority,
+  payload?: unknown,
+): Promise<NotifyDispatchResult> {
+  void cwd;
+  const platforms = eventPlatforms.length > 0 ? eventPlatforms : config.defaultPlatforms;
+  const enabled = new Set(getEnabledPlatforms(config));
+  const enabledPlatforms = platforms.filter((platform) => enabled.has(platform));
+
+  const { send: platformsToSend, silenced: inputSilenced } =
+    filterPlatformsAfterInput(enabledPlatforms, config, Date.now(), eventType);
+
+  const results = await Promise.all(
+    platformsToSend.map(async (platform) => {
+      try {
+        await sendToPlatform(platform, title, message, config, eventType, priority, payload);
+        return { platform, success: true };
+      } catch (err) {
+        // SuppressedError is intentional, not a failure
+        if (err instanceof SuppressedError) {
+          return { platform, success: true, suppressed: true };
+        }
+        // Silently ignore — platform send failure is tracked in results.
+        return {
+          platform,
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    })
+  );
+
+  for (const platform of inputSilenced) {
+    results.push({ platform, success: true, suppressed: true });
+  }
+
+  const unsuppressed = results.filter((r) => !r.suppressed);
+  const allSuccess = results.length > 0 && unsuppressed.every((r) => r.success);
+  const suppressedPlatforms = results
+    .filter((r) => r.suppressed)
+    .map((r) => r.platform);
+
+  // Emit notification sent event
+  emitEvent(pi, UNIPI_EVENTS.NOTIFICATION_SENT, {
+    eventType,
+    platforms: enabledPlatforms,
+    success: allSuccess,
+    ...(suppressedPlatforms.length > 0 && { suppressedPlatforms }),
+    timestamp: new Date().toISOString(),
+  });
+
+  return { results, allSuccess };
+}
+
+async function sendToPlatform(
+  platform: NotifyPlatform,
+  title: string,
+  message: string,
+  config: NotifyConfig,
+  eventType: string,
+  priority?: NotifyPriority,
+  payload?: unknown,
+): Promise<void> {
+  switch (platform) {
+    case "native":
+      await sendNativeNotification(title, message, {
+        windowsAppId: config.native.windowsAppId,
+        suppressWhenFocused: config.native.suppressWhenFocused,
+      });
+      return;
+    default: {
+      const id = platform.startsWith("webhook:") ? platform.slice("webhook:".length) : "";
+      const webhook = config.webhooks.find((item) => item.id === id && item.enabled);
+      if (!webhook) throw new Error(`Webhook route is not configured: ${platform}`);
+      await sendWebhookNotification(webhook, { title, message, eventType, priority, payload });
+    }
+  }
+}
+
+/** Build notification message from event key and payload */
+function buildEventMessage(eventKey: string, payload: unknown): string {
+  const p = payload as Record<string, unknown>;
+
+  switch (eventKey) {
+    case "workflow_end":
+      return `Workflow ${String(p.command || "unknown")}${p.success === false ? " failed" : " completed"}`;
+    case "ralph_loop_end":
+      return `Ralph loop "${String(p.name || "unknown")}" ${p.status || "completed"}`;
+    case "mcp_server_error":
+      return `Server "${String(p.name || "unknown")}" error: ${String(p.error || "unknown error")}`;
+    case "agent_end":
+      return "Agent run finished responding";
+    case "agent_settled":
+      return "Agent is complete";
+    case "memory_consolidated":
+      return `Memory consolidated (${p.count || 0} items)`;
+    case "session_shutdown":
+      return "Session ending";
+    case "ask_user_prompt":
+      return buildAskUserPromptMessage(payload);
+    case "permission_request":
+      return buildPermissionPromptMessage(payload);
+    default:
+      return p.message ? String(p.message) : "Event occurred";
+  }
+}
+
+/** Register an agent lifecycle notification with session name and recap support. */
+function registerAgentNotification(
+  pi: ExtensionAPI,
+  eventKey: "agent_end" | "agent_settled",
+  config: NotifyConfig,
+  cwd: string,
+  dispatch: DispatchNotification = dispatchNotification
+): void {
+  const eventConfig = config.events[eventKey];
+  if (!eventConfig?.enabled) return;
+
+  const handler = (payload: unknown) => {
+    // A running background task with triggerOnCompletion wakes the agent in a
+    // fresh turn that produces its own agent_end/agent_settled. Notifying for
+    // this intermediate turn as well would duplicate the wake message.
+    if (hasPendingWakeTask()) return;
+
+    // Fire-and-forget: build message and dispatch in background,
+    // don't block agent lifecycle hooks from completing.
+    const sessionName = pi.getSessionName?.();
+    const title = `Pi — ${BUILTIN_EVENTS[eventKey].label}`;
+
+    if (config.recap.enabled) {
+      // Recap mode: summarize asynchronously, then dispatch.
+      // agent_settled does not currently include a messages payload, so fall
+      // back to the latest assistant message in the session.
+      const lastText = extractLastAssistantText(payload) ?? extractLastAssistantTextFromSession();
+      if (lastText && sessionCtx?.modelRegistry) {
+        const provider = extractProvider(config.recap.model);
+        const modelId = extractModelId(config.recap.model);
+        const model = sessionCtx.modelRegistry.find(provider, modelId);
+        if (model) {
+          sessionCtx.modelRegistry.getApiKeyAndHeaders(model)
+            .then((apiKeyResult) => {
+              const apiKey = apiKeyResult.ok ? (apiKeyResult as { apiKey?: string }).apiKey : undefined;
+              if (apiKey) {
+                return summarizeLastMessage(lastText, apiKey, model.baseUrl, model.api, modelId, {
+                  disableThinking: config.recap.disableThinking,
+                })
+                  .then((recap) => sessionName ? `${sessionName}: ${recap}` : recap);
+              }
+              return buildAgentLifecycleMessage(eventKey, sessionName);
+            })
+            .catch(() => buildAgentLifecycleMessage(eventKey, sessionName))
+            .then((message) =>
+              dispatch(pi, title, message, eventConfig.platforms, eventKey, config, cwd, "low", { sessionName })
+            )
+            .catch(() => {
+              // Silently ignore — background agent notification failure is non-blocking.
+            });
+          return;
+        }
+      }
+    }
+
+    // No recap or recap unavailable: dispatch immediately in background.
+    const message = buildAgentLifecycleMessage(eventKey, sessionName);
+    dispatch(pi, title, message, eventConfig.platforms, eventKey, config, cwd, "low", { sessionName }).catch(
+      () => {
+        // Silently ignore — background agent notification failure is non-blocking.
+      }
+    );
+  };
+
+  (pi as any).on(eventKey, handler);
+}
+
+/** Whether an event key is an agent lifecycle notification with custom handling. */
+function isAgentNotificationEvent(eventKey: string): eventKey is "agent_end" | "agent_settled" {
+  return eventKey === "agent_end" || eventKey === "agent_settled";
+}
+
+/** Build agent lifecycle message using session name. */
+function buildAgentLifecycleMessage(
+  eventKey: "agent_end" | "agent_settled",
+  sessionName: string | undefined
+): string {
+  const status = eventKey === "agent_end" ? "Agent run is complete" : "Agent is complete";
+  if (sessionName) return `${sessionName} - ${status}`;
+  return status;
+}
+
+/** Extract text from the latest assistant message in the current session. */
+function extractLastAssistantTextFromSession(): string | null {
+  const entries = sessionCtx?.sessionManager.getEntries() ?? [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry?.type !== "message") continue;
+    const text = extractAssistantText(entry.message);
+    if (text) return text;
+  }
+  return null;
+}
+
+/** Extract text from the last assistant message in an agent lifecycle payload. */
+function extractLastAssistantText(payload: unknown): string | null {
+  const p = payload as { messages?: Array<{ role?: string; content?: unknown }> };
+  if (!p?.messages || !Array.isArray(p.messages)) return null;
+
+  // Find last assistant message
+  for (let i = p.messages.length - 1; i >= 0; i--) {
+    const msg = p.messages[i];
+    if (msg?.role !== "assistant") continue;
+
+    const text = extractAssistantText(msg);
+    if (text) return text;
+  }
+
+  return null;
+}
+
+/** Extract text from an assistant message-like object. */
+function extractAssistantText(message: { role?: string; content?: unknown }): string | null {
+  if (message.role !== "assistant") return null;
+
+  const content = message.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    // Extract text blocks from content array.
+    const textParts: string[] = [];
+    for (const block of content) {
+      if (typeof block === "object" && block !== null) {
+        const b = block as { type?: string; text?: string };
+        if (b.type === "text" && typeof b.text === "string") {
+          textParts.push(b.text);
+        }
+      }
+    }
+    if (textParts.length > 0) return textParts.join("\n");
+  }
+
+  return null;
+}
+
+/** Extract provider from model reference (e.g. "openrouter/openai/gpt-oss-20b" → "openrouter") */
+function extractProvider(modelRef: string): string {
+  const slashIdx = modelRef.indexOf("/");
+  return slashIdx > 0 ? modelRef.slice(0, slashIdx) : modelRef;
+}
+
+/** Extract model ID from full reference (e.g. "openrouter/openai/gpt-oss-20b" → "openai/gpt-oss-20b") */
+function extractModelId(modelRef: string): string {
+  const slashIdx = modelRef.indexOf("/");
+  return slashIdx > 0 ? modelRef.slice(slashIdx + 1) : modelRef;
+}

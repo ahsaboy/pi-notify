@@ -1,0 +1,66 @@
+{
+  "name": "pi-notify",
+  "version": "2.20.5",
+  "description": "Configurable HTTP webhook and native notifications for Pi lifecycle events",
+  "type": "module",
+  "main": "index.ts",
+  "license": "MIT",
+  "author": "Neuron Mr White",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ahsaboy/pi-notify.git"
+  },
+  "homepage": "https://github.com/ahsaboy/pi-notify",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "unipi",
+    "notify",
+    "notifications"
+  ],
+  "scripts": {
+    "test": "npm run typecheck && tsx --test src/__tests__/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "files": [
+    "*.ts",
+    "platforms/*",
+    "webhook.ts",
+    "tui/*",
+    "skills/**/*",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@pi-unipi/core": "2.20.5",
+    "node-notifier": "^10.0.1"
+  },
+  "overrides": {
+    "node-notifier": {
+      "uuid": "11.1.1"
+    }
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@earendil-works/pi-tui": "^0.84.0",
+    "typebox": "^1.1.38"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [],
+    "themes": []
+  }
+}
