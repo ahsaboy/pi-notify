@@ -9,7 +9,7 @@ import { dirname, join } from "path";
 import { homedir } from "os";
 import { NOTIFY_DIRS } from "@pi-unipi/core";
 import { mergeSilenceAfterInput } from "./activity.js";
-import type { NotifyConfig, RenotifyConfig } from "./types.js";
+import type { EventNotifyConfig, NotifyConfig, NotifyPlatform, RenotifyConfig } from "./types.js";
 
 /** Resolve config path (expands ~ to homedir) */
 function resolveConfigPath(): string {
@@ -117,7 +117,7 @@ function mergeWithDefaults(loaded: Partial<NotifyConfig>): NotifyConfig {
   const base = structuredClone(DEFAULT_CONFIG);
   return {
     defaultPlatforms: loaded.defaultPlatforms ?? base.defaultPlatforms,
-    events: { ...base.events, ...loaded.events },
+    events: mergeEvents(loaded.events, base.events),
     native: { ...base.native, ...loaded.native },
     webhooks: Array.isArray(loaded.webhooks) ? loaded.webhooks : base.webhooks,
     recap: { ...base.recap, ...loaded.recap },
@@ -127,6 +127,31 @@ function mergeWithDefaults(loaded: Partial<NotifyConfig>): NotifyConfig {
     ),
     renotify: mergeRenotify(loaded.renotify, base.renotify),
   };
+}
+
+/** Merge event blocks and discard invalid platform routes from disk. */
+function mergeEvents(
+  loaded: NotifyConfig["events"] | undefined,
+  defaults: NotifyConfig["events"],
+): Record<string, EventNotifyConfig> {
+  const merged: Record<string, EventNotifyConfig> = {};
+  const keys = new Set([...Object.keys(defaults), ...Object.keys(loaded ?? {})]);
+  for (const key of keys) {
+    const fallback = defaults[key] ?? { enabled: false, platforms: [] };
+    const candidate = loaded?.[key];
+    merged[key] = {
+      enabled: typeof candidate?.enabled === "boolean" ? candidate.enabled : fallback.enabled,
+      platforms: Array.isArray(candidate?.platforms)
+        ? candidate.platforms.filter(isNotifyPlatform)
+        : fallback.platforms.slice(),
+    };
+  }
+  return merged;
+}
+
+function isNotifyPlatform(value: unknown): value is NotifyPlatform {
+  return value === "native" ||
+    (typeof value === "string" && /^webhook:[a-zA-Z0-9_-]+$/.test(value));
 }
 
 /** Merge the renotify block, falling back per-field on invalid scalars. */

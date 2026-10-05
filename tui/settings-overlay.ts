@@ -50,6 +50,10 @@ export class NotifySettingsOverlay implements Component {
   private selectedIndex = 0;
   /** Which silence-after-input chip is focused (0–3). */
   private chipIndex = 0;
+  /** Whether the selected event is editing its platform routes. */
+  private eventPlatformMode = false;
+  /** Which platform chip is focused while editing an event. */
+  private eventPlatformIndex = 0;
   private error: string | null = null;
   private saved = false;
   onClose?: () => void;
@@ -80,6 +84,28 @@ export class NotifySettingsOverlay implements Component {
     // Escape arrives as "\x1b[27u" (or "\x1b[27;1;27~" with modifyOtherKeys)
     // and arrows as "\x1b[57419u"/"\x1b[57420u" — exact legacy comparisons
     // like data === "\x1b[A" silently fail there.
+    if (this.section === "events" && this.eventPlatformMode) {
+      if (data === "p" || data === "P" || matchesKey(data, "escape")) {
+        this.eventPlatformMode = false;
+        return;
+      }
+      if (matchesKey(data, "left") || data === "h") {
+        this.eventPlatformIndex = Math.max(0, this.eventPlatformIndex - 1);
+        return;
+      }
+      if (matchesKey(data, "right") || data === "l") {
+        this.eventPlatformIndex = Math.min(this.platformKeys.length - 1, this.eventPlatformIndex + 1);
+        return;
+      }
+      if (data === "r" || data === "R") {
+        this.resetEventPlatforms();
+        return;
+      }
+      if (matchesKey(data, "space")) {
+        this.toggleEventPlatform();
+        return;
+      }
+    }
     if (matchesKey(data, "up") || data === "k") {
       this.selectedIndex = Math.max(0, this.selectedIndex - 1);
       return;
@@ -127,12 +153,20 @@ export class NotifySettingsOverlay implements Component {
       const idx = sections.indexOf(this.section);
       this.section = sections[(idx + 1) % sections.length];
       this.selectedIndex = 0;
+      this.eventPlatformMode = false;
       return;
     }
     if (data === "m" || data === "M") {
       // Open model selector (only in recap section)
       if (this.section === "recap") {
         this.onOpenModelSelector?.();
+      }
+      return;
+    }
+    if (data === "p" || data === "P") {
+      if (this.section === "events") {
+        this.eventPlatformMode = true;
+        this.eventPlatformIndex = 0;
       }
       return;
     }
@@ -200,6 +234,41 @@ export class NotifySettingsOverlay implements Component {
     } else effective.push(key);
     const ordered = keys.filter((platform) => effective.includes(platform));
     this.config.silenceAfterInput.platforms = ordered.length === keys.length ? [] : ordered;
+  }
+
+  private selectedEventConfig(): { key: string; config: NotifyConfig["events"][string] } | undefined {
+    const entry = Object.entries(this.config.events)[this.selectedIndex];
+    if (!entry) return undefined;
+    const [key, config] = entry;
+    return { key, config };
+  }
+
+  private eventPlatformIsOn(platform: NotifyPlatform, eventConfig: NotifyConfig["events"][string]): boolean {
+    const routes = eventConfig.platforms.length > 0
+      ? eventConfig.platforms
+      : this.config.defaultPlatforms;
+    return routes.includes(platform);
+  }
+
+  private toggleEventPlatform(): void {
+    const selected = this.selectedEventConfig();
+    const platform = this.platformKeys[this.eventPlatformIndex];
+    if (!selected || !platform) return;
+
+    // An empty list inherits the global routes. Copy those routes before the
+    // first edit so changing one chip does not mutate the global default.
+    const routes = selected.config.platforms.length > 0
+      ? selected.config.platforms.slice()
+      : this.config.defaultPlatforms.slice();
+    const index = routes.indexOf(platform);
+    if (index >= 0) routes.splice(index, 1);
+    else routes.push(platform);
+    selected.config.platforms = this.platformKeys.filter((key) => routes.includes(key));
+  }
+
+  private resetEventPlatforms(): void {
+    const selected = this.selectedEventConfig();
+    if (selected) selected.config.platforms = [];
   }
 
   private toggleCurrent(): void {
@@ -308,6 +377,12 @@ export class NotifySettingsOverlay implements Component {
   }
 
   private footerHint(): string {
+    if (this.section === "events" && this.eventPlatformMode) {
+      return "↑↓ event · ←→ platform · Space toggle route · R inherit defaults · P done · Enter save · Esc cancel";
+    }
+    if (this.section === "events") {
+      return "↑↓ navigate · Space enable · P edit platforms · Tab switch · Enter save · Esc cancel";
+    }
     if (this.section === "recap") {
       return "↑↓ navigate · Space toggle · M change model · Tab switch · Enter save · Esc cancel";
     }
@@ -427,14 +502,47 @@ export class NotifySettingsOverlay implements Component {
       const toggleOff = this.overlay.fg("dim", "○");
       const toggle = cfg.enabled ? toggleOn : toggleOff;
       const label = isSelected ? this.overlay.bold(key) : this.overlay.fg("dim", key);
+      const routes = this.eventPlatformsSummary(cfg);
 
       lines.push(
         this.overlay.frameLine(
-          `${isSelected ? this.overlay.fg("accent", "▸") : " "} ${toggle} ${label}`,
+          `${isSelected ? this.overlay.fg("accent", "▸") : " "} ${toggle} ${label}  ${this.overlay.fg("dim", routes)}`,
           innerWidth
         )
       );
+
+      if (isSelected && this.eventPlatformMode) {
+        const chips = this.platformKeys.map((platform, index) => {
+          const label = this.platformLabel(platform);
+          const on = this.eventPlatformIsOn(platform, cfg);
+          const mark = on ? "●" : "○";
+          const focused = index === this.eventPlatformIndex;
+          const text = `${mark} ${label}`;
+          if (focused) return this.overlay.fg("accent", this.overlay.bold(`[${text}]`));
+          return on
+            ? `${this.overlay.fg("success", mark)} ${label}`
+            : this.overlay.fg("dim", text);
+        });
+        lines.push(
+          this.overlay.frameLine(
+            `      ${this.overlay.fg("dim", "Platforms:")} ${chips.join("  ")}`,
+            innerWidth,
+          ),
+        );
+      }
     }
+  }
+
+  private platformLabel(platform: NotifyPlatform): string {
+    return platform === "native" ? "Native" : platform.slice("webhook:".length);
+  }
+
+  private eventPlatformsSummary(eventConfig: NotifyConfig["events"][string]): string {
+    if (eventConfig.platforms.length === 0) {
+      const defaults = this.config.defaultPlatforms.map((platform) => this.platformLabel(platform));
+      return `platforms: defaults${defaults.length > 0 ? ` (${defaults.join(", ")})` : ""}`;
+    }
+    return `platforms: ${eventConfig.platforms.map((platform) => this.platformLabel(platform)).join(", ")}`;
   }
 
   private renderRecap(lines: string[], innerWidth: number): void {

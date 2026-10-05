@@ -112,4 +112,17 @@ describe("loadConfig deep copy", () => {
     const reloaded = loadConfig();
     assert.equal(reloaded.webhooks[0]?.enabled, true);
   });
+
+  it("fills missing event platform routes for older config files", () => {
+    const dir = join(home, ".unipi", "config", "notify");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "config.json"),
+      JSON.stringify({ events: { workflow_end: { enabled: false } } }),
+    );
+
+    const config = loadConfig();
+    assert.equal(config.events.workflow_end.enabled, false);
+    assert.deepEqual(config.events.workflow_end.platforms, []);
+  });
 });

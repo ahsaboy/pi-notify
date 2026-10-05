@@ -58,7 +58,7 @@ A string containing only a placeholder preserves the value's JSON type. For exam
 
 The package subscribes to Pi lifecycle events and supports per-event enable switches. Built-in events include workflow and Ralph completion, MCP errors, agent completion, session shutdown, ask-user prompts, and permission prompts. Blocking prompts can be re-sent until answered.
 
-- `/unipi:notify-settings` opens the settings overlay. Add webhook definitions by editing the JSON config; the overlay lists configured endpoints so they can be enabled and routed.
+- `/unipi:notify-settings` opens the settings overlay. Add webhook definitions by editing the JSON config; the overlay lists configured endpoints so they can be enabled and routed. In the Events tab, select an event and press `P` to edit its platform routes; press `R` to restore global defaults.
 - `/unipi:notify-test` sends a test through the configured default routes.
 - `/unipi:notify-event <event> <on|off>` toggles an event.
 - `notify_user` sends an ad-hoc notification.

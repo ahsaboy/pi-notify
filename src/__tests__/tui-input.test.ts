@@ -255,6 +255,53 @@ describe("settings overlay: toggle, tab, model-selector key, save", () => {
       );
     }
   });
+
+  it("edits and saves per-event platform routes", () => {
+    freshHome();
+    const dir = join(home, ".unipi/config/notify");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.json"), JSON.stringify({
+      defaultPlatforms: ["native", "webhook:alerts"],
+      webhooks: [
+        { id: "alerts", enabled: true, url: "https://example.com/hook", headers: {} },
+      ],
+    }));
+
+    const overlay = new NotifySettingsOverlay();
+    overlay.handleInput("\t"); // platforms -> events
+    assert.ok(stripAnsi(selectedLine(overlay)).includes("platforms: defaults (Native, alerts)"));
+    overlay.handleInput("p");
+    assert.ok(stripAnsi(overlay.render(80).find((line) => line.includes("Platforms:")) ?? "").includes("[● Native]"));
+    overlay.handleInput("l");
+    assert.ok(stripAnsi(overlay.render(80).find((line) => line.includes("Platforms:")) ?? "").includes("[● alerts]"));
+    overlay.handleInput(" "); // remove alerts from the inherited route set
+    overlay.handleInput("\r");
+
+    const config = readNotifyConfig() as { events: Record<string, { platforms: string[] }> };
+    assert.deepEqual(config.events.workflow_end.platforms, ["native"]);
+  });
+
+  it("restores an event to the global default routes", () => {
+    freshHome();
+    const dir = join(home, ".unipi/config/notify");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.json"), JSON.stringify({
+      defaultPlatforms: ["native"],
+      events: { workflow_end: { enabled: true, platforms: ["webhook:alerts"] } },
+      webhooks: [
+        { id: "alerts", enabled: true, url: "https://example.com/hook", headers: {} },
+      ],
+    }));
+
+    const overlay = new NotifySettingsOverlay();
+    overlay.handleInput("\t"); // -> events
+    overlay.handleInput("p");
+    overlay.handleInput("r");
+    overlay.handleInput("\r");
+
+    const config = readNotifyConfig() as { events: Record<string, { platforms: string[] }> };
+    assert.deepEqual(config.events.workflow_end.platforms, []);
+  });
 });
 
 function goToSilenceMaster(overlay: NotifySettingsOverlay): void {
